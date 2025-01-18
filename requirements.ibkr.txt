@@ -1,0 +1,7 @@
+ib_insync==0.9.70
+pandas==2.1.4
+pandas_ta==0.3.14b0
+supabase==2.3.1
+python-dotenv==1.0.0
+asyncio==3.4.3
+ta-lib==0.4.28 

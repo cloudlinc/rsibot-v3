@@ -1,0 +1,11 @@
+#cloud-config
+users:
+  - name: trading
+    sudo: ['ALL=(ALL) NOPASSWD:ALL']
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICwBM0Il2wllzVOq8pVvA9V31ulcdnrYeaTH2QP2asEW data@nelor.com
+
+packages:
+  - docker.io
+  - git
