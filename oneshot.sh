@@ -127,6 +127,7 @@ cd "$IBGW_DIR/ibc"
 echo "Downloading IBC..."
 wget -q https://github.com/IbcAlpha/IBC/releases/download/3.15.2/IBCLinux-3.15.2.zip
 unzip -q IBCLinux-3.15.2.zip
+chmod +x scripts/*
 
 # Configure IBC
 cat << 'CONFIG_EOF' > config.ini
@@ -164,8 +165,26 @@ PrintReplies=no
 LogComponents=never
 CONFIG_EOF
 
+# Create a startup script for IB Gateway
+cat << 'STARTUP_EOF' > /root/start-ibgateway.sh
+#!/bin/bash
+
+# Start Xvfb
+Xvfb :1 -screen 0 1024x768x24 &
+export DISPLAY=:1
+
+# Wait for Xvfb to start
+sleep 5
+
+# Start IB Gateway using IBC
+cd /root/ibgateway/ibc
+./scripts/ibcstart.sh
+STARTUP_EOF
+
+chmod +x /root/start-ibgateway.sh
+
 # Create systemd service for IB Gateway
-cat << SERVICE_EOF > /etc/systemd/system/ibgateway.service
+cat << 'SERVICE_EOF' > /etc/systemd/system/ibgateway.service
 [Unit]
 Description=Interactive Brokers Gateway
 After=network.target
@@ -173,9 +192,7 @@ After=network.target
 [Service]
 Type=simple
 User=root
-Environment="DISPLAY=:1"
-ExecStartPre=/usr/bin/Xvfb :1 -screen 0 1024x768x24 &
-ExecStart=$IBGW_DIR/ibc/scripts/ibcstart.sh
+ExecStart=/root/start-ibgateway.sh
 Restart=always
 RestartSec=30
 
@@ -188,9 +205,10 @@ systemctl daemon-reload
 systemctl enable ibgateway
 systemctl start ibgateway
 
-# Wait for IB Gateway to start
+# Wait for IB Gateway to start and check its status
 echo "Waiting for IB Gateway to start..."
 sleep 30
+systemctl status ibgateway
 
 # 2. Make a bot directory
 BOT_DIR="/bot"
