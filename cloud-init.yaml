@@ -7,5 +7,6 @@ users:
       - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICwBM0Il2wllzVOq8pVvA9V31ulcdnrYeaTH2QP2asEW data@nelor.com
 
 packages:
-  - docker.io
+  - python3-pip
+  - python3-venv
   - git

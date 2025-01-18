@@ -13,12 +13,13 @@ IBKR_PASSWORD=${IBKR_PASSWORD:-"Maxamillion@383"}
 # Check required tools
 command -v doctl >/dev/null 2>&1 || { echo "Please install doctl first: https://docs.digitalocean.com/reference/doctl/how-to/install/"; exit 1; }
 
-# Ensure we have DO token
-if [ -z "$DO_TOKEN" ]; then
-    echo "Error: Please set DO_TOKEN environment variable"
-    echo "Example: export DO_TOKEN=\"your_digitalocean_token\""
-    exit 1
-fi
+# Validate required environment variables
+for var in DO_TOKEN GITHUB_PAT GITHUB_USERNAME SSH_KEY_NAME; do
+    if [ -z "${!var}" ]; then
+        echo "Error: Please set $var environment variable"
+        exit 1
+    fi
+done
 
 # Configure doctl with token
 doctl auth init -t "$DO_TOKEN"
@@ -48,7 +49,8 @@ users:
       - ${SSH_PUBLIC_KEY}
 
 packages:
-  - docker.io
+  - python3-pip
+  - python3-venv
   - git
 EOL
 
@@ -92,38 +94,59 @@ while sudo fuser /var/lib/dpkg/lock >/dev/null 2>&1 || sudo fuser /var/lib/apt/l
     sleep 5
 done
 
-# Install Docker if not installed
-if ! command -v docker &> /dev/null; then
-    echo "Installing Docker..."
-    sudo apt-get update
-    sudo apt-get install -y docker.io git
-    sudo systemctl start docker
-    sudo systemctl enable docker
-    sudo usermod -aG docker trading
-fi
+# Update system and install dependencies
+echo "Installing system dependencies..."
+sudo apt-get update
+sudo apt-get install -y python3-pip python3-venv git
 
-# Create .env file
-cat > ~/.env << 'ENVEOF'
-GITHUB_USERNAME=cloudlinc
-GITHUB_PAT=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
-IBKR_USERNAME=scap3883
-IBKR_PASSWORD=Maxamillion@383
-ENVEOF
-chmod 600 ~/.env
+# Create virtual environment directory if it doesn't exist
+mkdir -p ~/venv
 
 # Clone repository if not exists
 if [ ! -d ~/bot ]; then
-    git clone https://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@github.com/cloudlinc/rsibot-v1.git ~/bot
+    git clone https://${GITHUB_PAT}@github.com/${GITHUB_USERNAME}/rsibot-v3.git ~/bot
 fi
 
-# Build and run container
+# Set up Python virtual environment
 cd ~/bot
-docker build -t rsi-bot -f Dockerfile.ibkr .
-docker run -d --name rsi-bot --env-file ~/.env rsi-bot
+python3 -m venv ~/venv/bot
+source ~/venv/bot/bin/activate
+
+# Install requirements based on broker
+if [ "${BROKER}" = "ibkr" ]; then
+    pip install -r requirements.ibkr.txt
+else
+    pip install -r requirements.schwab.txt
+fi
+
+# Create systemd service file
+sudo tee /etc/systemd/system/trading-bot.service << 'SERVICEEOF'
+[Unit]
+Description=Trading Bot Service
+After=network.target
+
+[Service]
+Type=simple
+User=trading
+WorkingDirectory=/home/trading/bot
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/home/trading/.env
+ExecStart=/home/trading/venv/bot/bin/python main.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+SERVICEEOF
+
+# Start and enable the service
+sudo systemctl daemon-reload
+sudo systemctl enable trading-bot
+sudo systemctl start trading-bot
 EOL
 
 # Make script executable and run it
-ssh trading@${DROPLET_IP} "chmod +x setup.sh && ./setup.sh"
+ssh trading@${DROPLET_IP} "chmod +x setup.sh && BROKER=${BROKER} GITHUB_PAT=${GITHUB_PAT} GITHUB_USERNAME=${GITHUB_USERNAME} ./setup.sh"
 
 echo "
 Deployment completed!
@@ -132,11 +155,11 @@ Your trading bot is being deployed to: ${DROPLET_IP}
 Broker type: ${BROKER}
 
 To check if the bot is running:
-ssh trading@${DROPLET_IP} 'docker ps'
+ssh trading@${DROPLET_IP} 'sudo systemctl status trading-bot'
 
 To view bot logs:
-ssh trading@${DROPLET_IP} 'docker logs -f rsi-bot'
+ssh trading@${DROPLET_IP} 'sudo journalctl -fu trading-bot'
 
-To check system logs:
-ssh trading@${DROPLET_IP} 'sudo journalctl -fu docker'
+To restart the bot:
+ssh trading@${DROPLET_IP} 'sudo systemctl restart trading-bot'
 " 
