@@ -1,0 +1,6 @@
+aiohttp==3.9.1
+pandas==2.1.4
+pandas-ta==0.3.14b0
+supabase==2.3.0
+python-dotenv==1.0.0
+requests==2.31.0 

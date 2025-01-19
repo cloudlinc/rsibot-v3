@@ -10,3 +10,12 @@ packages:
   - python3-pip
   - python3-venv
   - git
+
+runcmd:
+  - mkdir -p /home/trading/bot/logs
+  - chown -R trading:trading /home/trading/bot
+  - sudo -u trading python3 -m venv /home/trading/bot/venv
+  - sudo -u trading /home/trading/bot/venv/bin/pip install -r /home/trading/bot/requirements.schwab.txt
+  - systemctl daemon-reload
+  - systemctl enable schwab-bot
+  - systemctl start schwab-bot

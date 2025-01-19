@@ -10,51 +10,218 @@ from supabase import create_client, Client
 import aiohttp
 import json
 from typing import Dict, List, Optional
+from dotenv import load_dotenv
+import sys
+import requests  # <-- NEW: used for token exchange example
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('/bot/trading.log')
-    ]
-)
-logger = logging.getLogger(__name__)
+def setup_logging():
+    """Set up logging configuration."""
+    logging.basicConfig(
+        level=os.environ.get("LOG_LEVEL", "INFO"),
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler('/home/trading/bot/logs/trading.log')
+        ]
+    )
+    return logging.getLogger(__name__)
 
-# Schwab API Configuration
+# Initialize logger first
+logger = setup_logging()
+
+# Load environment variables
+logger.info("Loading environment variables...")
+env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+logger.info(f"Looking for .env file at: {env_path}")
+
+if os.path.exists(env_path):
+    logger.info("Found .env file")
+    load_dotenv(env_path)
+    logger.info("Environment variables loaded from .env file")
+else:
+    logger.warning("No .env file found")
+
+# Global variables for configuration
+env_vars = {}
+keys_to_load = [
+    "SUPABASE_URL",
+    "SUPABASE_KEY",
+    "SCHWAB_TRADER_TOKEN",
+    "SCHWAB_MARKET_TOKEN",
+    "SCHWAB_ACCOUNT_NUMBER",
+    "SYMBOLS",
+    "RSI_PERIOD",
+    "RSI_OVERBOUGHT",
+    "RSI_OVERSOLD",
+    "POSITION_SIZE",
+    # NEW KEYS BELOW
+    "SCHWAB_CLIENT_ID",
+    "SCHWAB_CLIENT_SECRET",
+    "SCHWAB_REDIRECT_URI",
+    "SCHWAB_AUTH_CODE",
+    "SCHWAB_REFRESH_TOKEN"
+]
+
+for key in keys_to_load:
+    value = os.environ.get(key)
+    # For security, don't log sensitive tokens
+    if key in ["SUPABASE_KEY", "SCHWAB_TRADER_TOKEN", "SCHWAB_MARKET_TOKEN",
+               "SCHWAB_CLIENT_ID", "SCHWAB_CLIENT_SECRET", "SCHWAB_AUTH_CODE", "SCHWAB_REFRESH_TOKEN"]:
+        logger.info(f"Loaded {key}: {'***' if value else 'None'}")
+    else:
+        logger.info(f"Loaded {key}: {value}")
+
+    env_vars[key] = value
+
+# Basic checks
+if not env_vars.get("SUPABASE_URL"):
+    logger.error("SUPABASE_URL is missing")
+if not env_vars.get("SUPABASE_KEY"):
+    logger.error("SUPABASE_KEY is missing")
+
+# Initialize API URLs
 SCHWAB_TRADER_API = "https://api.schwabapi.com/trader/v1"
 SCHWAB_MARKET_API = "https://api.schwabapi.com/marketdata/v1"
-SCHWAB_USERNAME = os.getenv("SCHWAB_USERNAME")
-SCHWAB_PASSWORD = os.getenv("SCHWAB_PASSWORD")
-SCHWAB_TRADER_TOKEN = os.getenv("SCHWAB_TRADER_TOKEN")
-SCHWAB_MARKET_TOKEN = os.getenv("SCHWAB_MARKET_TOKEN")
 
-# Supabase configuration
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-# Trading parameters
-SYMBOLS = ["AAPL", "MSFT", "GOOGL"]  # Stocks to monitor
-RSI_PERIOD = 14
-RSI_OVERBOUGHT = 70
-RSI_OVERSOLD = 30
-POSITION_SIZE = 100  # Number of shares per trade
+# --------------------------------------------------------
+# NEW SECTION: Helpers for OAuth2 token fetching/refresh
+# --------------------------------------------------------
+def fetch_schwab_access_token(auth_code: str, client_id: str, client_secret: str, redirect_uri: str) -> Dict[str, str]:
+    """
+    Exchange the given auth_code for an access_token and refresh_token from Schwab.
+    """
+    logger.info("Fetching new Schwab access token using authorization code...")
+    token_url = "https://api.schwabapi.com/v1/oauth/token"
+
+    data = {
+        "grant_type": "authorization_code",
+        "code": auth_code,
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "redirect_uri": redirect_uri
+    }
+
+    response = requests.post(token_url, data=data)
+    if response.status_code == 200:
+        token_data = response.json()
+        logger.info("Successfully obtained Schwab tokens via authorization code.")
+        return token_data  # includes access_token, refresh_token, expires_in, etc.
+    else:
+        logger.error(f"Failed to fetch tokens. Status {response.status_code}: {response.text}")
+        raise ValueError("Could not obtain Schwab tokens from auth code")
+
+def refresh_schwab_access_token(refresh_token: str, client_id: str, client_secret: str) -> Dict[str, str]:
+    """
+    Use the provided refresh_token to get a new access_token (and possibly new refresh_token).
+    """
+    logger.info("Refreshing Schwab access token using refresh token...")
+    token_url = "https://api.schwabapi.com/v1/oauth/token"
+
+    data = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": client_id,
+        "client_secret": client_secret
+    }
+
+    response = requests.post(token_url, data=data)
+    if response.status_code == 200:
+        token_data = response.json()
+        logger.info("Successfully refreshed Schwab tokens.")
+        return token_data
+    else:
+        logger.error(f"Failed to refresh tokens. Status {response.status_code}: {response.text}")
+        raise ValueError("Could not refresh Schwab tokens")
+
+def ensure_schwab_tokens(env_vars: Dict[str, str]) -> Dict[str, str]:
+    """
+    If SCHWAB_TRADER_TOKEN/MARKET_TOKEN are missing or empty, tries to:
+      1) use SCHWAB_AUTH_CODE to do a new token exchange, or
+      2) use SCHWAB_REFRESH_TOKEN to do a token refresh.
+    Returns updated env_vars with the new tokens if successful.
+    """
+    trader_token = env_vars.get("SCHWAB_TRADER_TOKEN")
+    market_token = env_vars.get("SCHWAB_MARKET_TOKEN")
+
+    if trader_token and market_token:
+        logger.info("SCHWAB_TRADER_TOKEN and SCHWAB_MARKET_TOKEN already provided. Skipping OAuth fetch/refresh.")
+        return env_vars
+
+    client_id = env_vars.get("SCHWAB_CLIENT_ID")
+    client_secret = env_vars.get("SCHWAB_CLIENT_SECRET")
+    redirect_uri = env_vars.get("SCHWAB_REDIRECT_URI")
+    auth_code = env_vars.get("SCHWAB_AUTH_CODE")
+    refresh_token = env_vars.get("SCHWAB_REFRESH_TOKEN")
+
+    # Basic check
+    if not client_id or not client_secret:
+        logger.warning("No client_id/client_secret found. Cannot fetch or refresh tokens automatically.")
+        return env_vars  # Let the user proceed with placeholders or handle externally
+
+    # Try refresh first if we have a refresh token
+    if refresh_token:
+        try:
+            token_data = refresh_schwab_access_token(refresh_token, client_id, client_secret)
+            new_access = token_data.get("access_token")
+            new_refresh = token_data.get("refresh_token")  # might be the same or new
+            if new_access:
+                env_vars["SCHWAB_TRADER_TOKEN"] = new_access
+                env_vars["SCHWAB_MARKET_TOKEN"] = new_access
+                env_vars["SCHWAB_REFRESH_TOKEN"] = new_refresh if new_refresh else refresh_token
+                logger.info("Updated SCHWAB_TRADER_TOKEN and SCHWAB_MARKET_TOKEN from refresh token.")
+                return env_vars
+        except Exception as e:
+            logger.error(f"Refresh token attempt failed: {e}")
+            # fallback to trying auth_code
+
+    # If we have an auth_code, try exchanging it for tokens
+    if auth_code:
+        try:
+            token_data = fetch_schwab_access_token(auth_code, client_id, client_secret, redirect_uri)
+            new_access = token_data.get("access_token")
+            new_refresh = token_data.get("refresh_token")
+            if new_access:
+                env_vars["SCHWAB_TRADER_TOKEN"] = new_access
+                env_vars["SCHWAB_MARKET_TOKEN"] = new_access
+                if new_refresh:
+                    env_vars["SCHWAB_REFRESH_TOKEN"] = new_refresh
+                logger.info("Updated SCHWAB_TRADER_TOKEN and SCHWAB_MARKET_TOKEN from auth code.")
+                return env_vars
+        except Exception as e:
+            logger.error(f"Auth code token exchange failed: {e}")
+
+    # If we got here, we couldn't fetch or refresh tokens automatically
+    logger.warning("Could not fetch/refresh Schwab tokens automatically. Check logs for details.")
+    return env_vars
+
+# --------------------------------------------------------
+# END OAuth2 HELPERS
+# --------------------------------------------------------
+
 
 class SchwabAPI:
-    def __init__(self):
-        self.trader_session = aiohttp.ClientSession()
-        self.market_session = aiohttp.ClientSession()
-        self.trader_token = SCHWAB_TRADER_TOKEN
-        self.market_token = SCHWAB_MARKET_TOKEN
-        self.account_numbers = {}  # Map of plain text to encrypted account numbers
-        
-    def _get_correlation_id(self) -> str:
-        """Generate a unique correlation ID for Schwab API requests"""
-        return str(uuid.uuid4())
+    def __init__(self, trader_token, market_token):
+        self.trader_token = trader_token
+        self.market_token = market_token
+        self.trader_session = None
+        self.market_session = None
+        if not self.trader_token or not self.market_token:
+            raise ValueError("Schwab API tokens are missing")
+        self.account_numbers = {}
         
     async def connect(self):
-        """Initialize connection and get account numbers"""
+        """Initialize API sessions"""
+        logger.info("Initializing Schwab API sessions...")
+        
+        # Create sessions
+        timeout = aiohttp.ClientTimeout(total=30)
+        
+        # Create sessions
+        self.trader_session = aiohttp.ClientSession(timeout=timeout)
+        self.market_session = aiohttp.ClientSession(timeout=timeout)
+        
+        # Get account numbers
         try:
             headers = {
                 "Authorization": f"Bearer {self.trader_token}",
@@ -63,7 +230,7 @@ class SchwabAPI:
             }
             
             async with self.trader_session.get(
-                f"{SCHWAB_TRADER_API}/accounts/accountNumbers",
+                f"https://api.schwabapi.com/trader/v1/accounts/accountNumbers",
                 headers=headers
             ) as response:
                 if response.status == 200:
@@ -75,42 +242,45 @@ class SchwabAPI:
                     logger.info(f"Successfully connected to Schwab API. Found {len(self.account_numbers)} accounts.")
                 elif response.status == 401:
                     error = await response.json()
-                    raise Exception(f"Authentication failed: {error.get('message', 'Unknown error')}")
+                    raise Exception(f"Authentication failed (401): {error.get('message', 'Unknown error')}")
                 elif response.status == 403:
                     error = await response.json()
-                    raise Exception(f"Access forbidden: {error.get('message', 'Unknown error')}")
+                    raise Exception(f"Access forbidden (403): {error.get('message', 'Unknown error')}")
                 else:
                     error = await response.text()
                     raise Exception(f"Failed to get account numbers: {error}")
-                    
         except Exception as e:
             logger.error(f"Failed to connect to Schwab API: {e}")
+            await self.disconnect()  # Clean up sessions on error
             raise
 
     async def disconnect(self):
-        """Close the sessions"""
-        await self.trader_session.close()
-        await self.market_session.close()
+        """Close API sessions"""
+        logger.info("Closing Schwab API sessions...")
+        if self.trader_session:
+            await self.trader_session.close()
+            self.trader_session = None
+        if self.market_session:
+            await self.market_session.close()
+            self.market_session = None
 
+    async def __aenter__(self):
+        await self.connect()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.disconnect()
+
+    def _get_correlation_id(self) -> str:
+        """Generate a unique correlation ID for Schwab API requests"""
+        return str(uuid.uuid4())
+        
     async def get_historical_data(self, symbol: str, period_type: str = "day", period: int = 10,
                                 frequency_type: str = "minute", frequency: int = 5,
                                 start_date: Optional[int] = None, end_date: Optional[int] = None,
                                 need_extended_hours: bool = False) -> pd.DataFrame:
         """
         Get historical price data for a symbol using Schwab's price history API.
-        
-        Args:
-            symbol: The stock symbol to get data for
-            period_type: The type of period ('day', 'month', 'year', 'ytd')
-            period: Number of periods to get data for (depends on period_type)
-            frequency_type: The type of frequency ('minute', 'daily', 'weekly', 'monthly')
-            frequency: The frequency value (depends on frequency_type)
-            start_date: Optional start date in UNIX milliseconds
-            end_date: Optional end date in UNIX milliseconds
-            need_extended_hours: Whether to include extended hours data
-            
-        Returns:
-            DataFrame with columns: datetime, open, high, low, close, volume
         """
         params = {
             "symbol": symbol,
@@ -134,7 +304,7 @@ class SchwabAPI:
         
         try:
             async with self.market_session.get(
-                f"{SCHWAB_MARKET_API}/pricehistory",
+                "https://api.schwabapi.com/marketdata/v1/pricehistory",
                 params=params,
                 headers=headers
             ) as response:
@@ -175,27 +345,7 @@ class SchwabAPI:
             raise Exception(f"Unexpected error while getting price history: {str(e)}")
 
     async def get_quote(self, symbol: str) -> Dict:
-        """Get current quote using Market Data API
-        
-        Args:
-            symbol: The stock symbol to get a quote for
-            
-        Returns:
-            Dict containing quote data with the following structure:
-            {
-                'last_price': float,
-                'bid_price': float,
-                'ask_price': float,
-                'volume': int,
-                'mark': float,
-                'mark_change': float,
-                'mark_percent_change': float,
-                'security_status': str,
-                'asset_type': str,
-                'description': str,
-                'exchange': str
-            }
-        """
+        """Get current quote using Market Data API."""
         try:
             headers = {
                 "Authorization": f"Bearer {self.market_token}",
@@ -208,7 +358,7 @@ class SchwabAPI:
             }
             
             async with self.market_session.get(
-                f"{SCHWAB_MARKET_API}/{symbol}/quotes",
+                f"https://api.schwabapi.com/marketdata/v1/{symbol}/quotes",
                 headers=headers,
                 params=params
             ) as response:
@@ -222,7 +372,6 @@ class SchwabAPI:
                     quote_data = symbol_data.get('quote', {})
                     ref_data = symbol_data.get('reference', {})
                     
-                    # Extract and normalize the data
                     return {
                         'last_price': quote_data.get('lastPrice', 0.0),
                         'bid_price': quote_data.get('bidPrice', 0.0),
@@ -244,10 +393,14 @@ class SchwabAPI:
                     return {}
                 else:
                     error = await response.text()
-                    error_json = await response.json()
-                    logger.error(f"Quote request failed with status {response.status}: {error_json.get('message', error)}")
-                    if 'errors' in error_json:
-                        logger.error(f"Error details: {error_json['errors']}")
+                    try:
+                        error_json = await response.json()
+                        logger.error(f"Quote request failed with status {response.status}: "
+                                     f"{error_json.get('message', error)}")
+                        if 'errors' in error_json:
+                            logger.error(f"Error details: {error_json['errors']}")
+                    except:
+                        logger.error(f"Quote request failed with status {response.status}. Response text: {error}")
                     raise Exception(f"Failed to get quote: {error}")
                     
         except Exception as e:
@@ -255,7 +408,7 @@ class SchwabAPI:
             return {}
 
     async def get_account_positions(self, account_number: str) -> List[Dict]:
-        """Get current positions using Trader API"""
+        """Get current positions using Trader API."""
         try:
             headers = {
                 "Authorization": f"Bearer {self.trader_token}",
@@ -268,7 +421,7 @@ class SchwabAPI:
                 raise ValueError(f"No encrypted value found for account {account_number}")
                 
             async with self.trader_session.get(
-                f"{SCHWAB_TRADER_API}/accounts/{encrypted_account}",
+                f"https://api.schwabapi.com/trader/v1/accounts/{encrypted_account}",
                 params={"fields": "positions"},
                 headers=headers
             ) as response:
@@ -284,11 +437,7 @@ class SchwabAPI:
             return []
 
     async def place_order(self, account_number: str, symbol: str, action: str, quantity: int) -> Optional[int]:
-        """Place a market order using Trader API
-        
-        Returns:
-            Optional[int]: The order ID if successful, None if failed
-        """
+        """Place a market order using Trader API."""
         try:
             headers = {
                 "Authorization": f"Bearer {self.trader_token}",
@@ -301,7 +450,6 @@ class SchwabAPI:
             if not encrypted_account:
                 raise ValueError(f"No encrypted value found for account {account_number}")
             
-            # Get current quote first
             quote = await self.get_quote(symbol)
             if not quote:
                 raise Exception(f"Could not get quote for {symbol}")
@@ -329,26 +477,28 @@ class SchwabAPI:
             }
             
             async with self.trader_session.post(
-                f"{SCHWAB_TRADER_API}/accounts/{encrypted_account}/orders",
+                f"https://api.schwabapi.com/trader/v1/accounts/{encrypted_account}/orders",
                 headers=headers,
                 json=order_data
             ) as response:
                 if response.status == 201:
-                    # Get order ID from Location header
                     order_url = response.headers.get('Location')
                     logger.info(f"Successfully placed {action} order for {quantity} shares of {symbol}")
                     if order_url:
                         logger.info(f"Order URL: {order_url}")
-                        # Extract order ID from URL
                         order_id = int(order_url.split('/')[-1])
                         return order_id
                     return None
                 else:
                     error = await response.text()
-                    error_json = await response.json()
-                    logger.error(f"Order placement failed with status {response.status}: {error_json.get('message', error)}")
-                    if 'errors' in error_json:
-                        logger.error(f"Error details: {error_json['errors']}")
+                    try:
+                        error_json = await response.json()
+                        logger.error(f"Order placement failed with status {response.status}: "
+                                     f"{error_json.get('message', error)}")
+                        if 'errors' in error_json:
+                            logger.error(f"Error details: {error_json['errors']}")
+                    except:
+                        logger.error(f"Order placement failed with status {response.status}. Response text: {error}")
                     raise Exception(f"Failed to place order: {error}")
                     
         except Exception as e:
@@ -356,15 +506,7 @@ class SchwabAPI:
             return None
 
     async def cancel_order(self, account_number: str, order_id: int) -> bool:
-        """Cancel an order using Trader API
-        
-        Args:
-            account_number: The account number
-            order_id: The ID of the order to cancel
-            
-        Returns:
-            bool: True if cancelled successfully, False otherwise
-        """
+        """Cancel an order using Trader API."""
         try:
             headers = {
                 "Authorization": f"Bearer {self.trader_token}",
@@ -377,22 +519,29 @@ class SchwabAPI:
                 raise ValueError(f"No encrypted value found for account {account_number}")
                 
             async with self.trader_session.delete(
-                f"{SCHWAB_TRADER_API}/accounts/{encrypted_account}/orders/{order_id}",
+                f"https://api.schwabapi.com/trader/v1/accounts/{encrypted_account}/orders/{order_id}",
                 headers=headers
             ) as response:
                 if response.status == 200:
                     logger.info(f"Successfully cancelled order {order_id}")
                     return True
                 elif response.status == 404:
-                    error_json = await response.json()
-                    logger.warning(f"Order {order_id} not found: {error_json.get('message')}")
+                    try:
+                        error_json = await response.json()
+                        logger.warning(f"Order {order_id} not found: {error_json.get('message')}")
+                    except:
+                        logger.warning("Order not found (404). No JSON response.")
                     return False
                 else:
                     error = await response.text()
-                    error_json = await response.json()
-                    logger.error(f"Order cancellation failed with status {response.status}: {error_json.get('message', error)}")
-                    if 'errors' in error_json:
-                        logger.error(f"Error details: {error_json['errors']}")
+                    try:
+                        error_json = await response.json()
+                        logger.error(f"Order cancellation failed with status {response.status}: "
+                                     f"{error_json.get('message', error)}")
+                        if 'errors' in error_json:
+                            logger.error(f"Error details: {error_json['errors']}")
+                    except:
+                        logger.error(f"Order cancellation failed with status {response.status}. Response text: {error}")
                     raise Exception(f"Failed to cancel order: {error}")
                     
         except Exception as e:
@@ -400,17 +549,7 @@ class SchwabAPI:
             return False
 
     async def get_orders(self, account_number: str, from_date: datetime = None, to_date: datetime = None, status: str = None) -> List[Dict]:
-        """Get order history using Trader API
-        
-        Args:
-            account_number: The account number to get orders for
-            from_date: Start date for order history (defaults to 30 days ago)
-            to_date: End date for order history (defaults to now)
-            status: Filter by order status (e.g. 'FILLED')
-            
-        Returns:
-            List of orders matching the criteria
-        """
+        """Get order history using Trader API."""
         try:
             headers = {
                 "Authorization": f"Bearer {self.trader_token}",
@@ -422,7 +561,6 @@ class SchwabAPI:
             if not encrypted_account:
                 raise ValueError(f"No encrypted value found for account {account_number}")
             
-            # Default to last 30 days if dates not specified
             if not from_date:
                 from_date = datetime.now(timezone.utc) - timedelta(days=30)
             if not to_date:
@@ -437,7 +575,7 @@ class SchwabAPI:
                 params["status"] = status
                 
             async with self.trader_session.get(
-                f"{SCHWAB_TRADER_API}/accounts/{encrypted_account}/orders",
+                f"https://api.schwabapi.com/trader/v1/accounts/{encrypted_account}/orders",
                 headers=headers,
                 params=params
             ) as response:
@@ -453,40 +591,75 @@ class SchwabAPI:
             logger.error(f"Error getting orders for account {account_number}: {e}")
             return []
 
+
 class RSITradingBot:
     def __init__(self):
-        self.schwab = SchwabAPI()
-        self.supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        """Initialize the RSI trading bot."""
+        logger.info("Initializing RSI Trading Bot...")
+
+        # NEW STEP: Attempt to fetch or refresh Schwab tokens if missing
+        updated_env = ensure_schwab_tokens(env_vars)
+
+        # Now pull final tokens from updated_env
+        supabase_url = updated_env["SUPABASE_URL"]
+        supabase_key = updated_env["SUPABASE_KEY"]
+        
+        if not supabase_url or not supabase_key:
+            logger.error("Supabase credentials are missing")
+            raise ValueError("Supabase credentials are missing")
+        
+        # Create Supabase client
+        try:
+            logger.info(f"Initializing Supabase connection to {supabase_url}")
+            self.supabase = create_client(supabase_url=supabase_url, supabase_key=supabase_key)
+            logger.info("Successfully connected to Supabase")
+        except Exception as e:
+            logger.error(f"Failed to initialize Supabase client: {e}")
+            raise
+        
+        # Schwab credentials
+        self.trader_token = updated_env["SCHWAB_TRADER_TOKEN"]
+        self.market_token = updated_env["SCHWAB_MARKET_TOKEN"]
+        self.account_number = updated_env["SCHWAB_ACCOUNT_NUMBER"]
+        
+        if not self.trader_token or not self.market_token:
+            raise ValueError("Schwab API tokens are missing")
+        if not self.account_number:
+            raise ValueError("Schwab account number is missing")
+        
+        # Initialize API client
+        self.api = SchwabAPI(self.trader_token, self.market_token)
+        
+        # Trading parameters
+        self.symbols = json.loads(updated_env["SYMBOLS"]) if updated_env["SYMBOLS"] else ["BITI"]
+        self.rsi_period = int(updated_env["RSI_PERIOD"]) if updated_env["RSI_PERIOD"] else 14
+        self.rsi_overbought = float(updated_env["RSI_OVERBOUGHT"]) if updated_env["RSI_OVERBOUGHT"] else 70.0
+        self.rsi_oversold = float(updated_env["RSI_OVERSOLD"]) if updated_env["RSI_OVERSOLD"] else 30.0
+        self.position_size = float(updated_env["POSITION_SIZE"]) if updated_env["POSITION_SIZE"] else 100
+        
+        self.pending_orders = {}  # symbol -> order_id
         self.positions = {}
-        self.account_number = os.getenv("SCHWAB_ACCOUNT_NUMBER")
-        self.pending_orders = {}  # Track pending orders by symbol
 
     def calculate_rsi_from_df(self, df: pd.DataFrame) -> pd.Series:
-        """Calculate RSI from a DataFrame containing OHLCV data"""
-        # Calculate price changes
+        """Calculate RSI from a DataFrame containing OHLCV data."""
         df['price_change'] = df['close'].diff()
-        
-        # Calculate gains (positive changes) and losses (negative changes)
         df['gain'] = df['price_change'].apply(lambda x: x if x > 0 else 0)
         df['loss'] = df['price_change'].apply(lambda x: abs(x) if x < 0 else 0)
         
-        # Calculate average gains and losses over RSI_PERIOD
-        avg_gain = df['gain'].rolling(window=RSI_PERIOD).mean()
-        avg_loss = df['loss'].rolling(window=RSI_PERIOD).mean()
+        avg_gain = df['gain'].rolling(window=self.rsi_period).mean()
+        avg_loss = df['loss'].rolling(window=self.rsi_period).mean()
         
-        # Calculate RS and RSI
         rs = avg_gain / avg_loss
         rsi = 100 - (100 / (1 + rs))
         return rsi
 
     async def calculate_rsi(self, symbol: str) -> float:
-        """Calculate RSI for a symbol using historical data"""
+        """Calculate RSI for a symbol using historical data."""
         try:
-            # Get historical data for RSI calculation (14 days of 5-min data)
-            end_date = int(datetime.now().timestamp() * 1000)  # Convert to milliseconds
+            end_date = int(datetime.now().timestamp() * 1000)  # ms
             start_date = int((datetime.now() - timedelta(days=14)).timestamp() * 1000)
             
-            df = await self.schwab.get_historical_data(
+            df = await self.api.get_historical_data(
                 symbol=symbol,
                 period_type="day",
                 period=14,
@@ -498,7 +671,7 @@ class RSITradingBot:
             
             if df.empty:
                 logging.warning(f"No data available to calculate RSI for {symbol}")
-                return 50.0  # Return neutral RSI if no data
+                return 50.0
                 
             rsi = self.calculate_rsi_from_df(df)
             current_rsi = rsi.iloc[-1]
@@ -507,10 +680,10 @@ class RSITradingBot:
             
         except Exception as e:
             logging.error(f"Error calculating RSI for {symbol}: {str(e)}")
-            return 50.0  # Return neutral RSI on error
+            return 50.0
 
     async def log_trade(self, symbol: str, action: str, rsi_value: float):
-        """Log trade to Supabase"""
+        """Log a trade to Supabase."""
         try:
             self.supabase.table('trades').insert({
                 'symbol': symbol,
@@ -518,23 +691,39 @@ class RSITradingBot:
                 'rsi': float(rsi_value),
                 'timestamp': datetime.now(timezone.utc).isoformat()
             }).execute()
-            logger.info(f"Trade logged: {symbol} {action} RSI={rsi_value}")
+            logger.info(f"Trade logged: {symbol} {action} at RSI {rsi_value}")
         except Exception as e:
             logger.error(f"Failed to log trade: {e}")
 
+    async def log_performance(self, symbol: str, closing_price: float, rsi_value: float, position_size: float, pnl: float):
+        """Log performance metrics to Supabase."""
+        try:
+            self.supabase.table('performance_metrics').insert({
+                'symbol': symbol,
+                'date': datetime.now(timezone.utc).date().isoformat(),
+                'closing_price': float(closing_price),
+                'rsi_value': float(rsi_value),
+                'position_size': float(position_size),
+                'pnl': float(pnl),
+                'created_at': datetime.now(timezone.utc).isoformat()
+            }).execute()
+            logger.info(f"Performance logged: {symbol} price={closing_price} rsi={rsi_value} pnl={pnl}")
+        except Exception as e:
+            logger.error(f"Failed to log performance: {e}")
+
     async def check_market_hours(self) -> bool:
-        """Check if market is currently open"""
+        """Check if market is currently open (roughly 9:30am-4pm ET)."""
         now = datetime.now(timezone.utc)
-        if now.weekday() >= 5:  # Weekend
+        if now.weekday() >= 5:
             return False
-        ny_time = now.replace(tzinfo=timezone.utc).astimezone(timezone.utc)
-        market_open = ny_time.replace(hour=13, minute=30, second=0)  # 9:30 AM ET
-        market_close = ny_time.replace(hour=20, minute=0, second=0)  # 4:00 PM ET
+        ny_time = now.astimezone(timezone.utc)  # or use a real US/Eastern
+        market_open = ny_time.replace(hour=13, minute=30, second=0)
+        market_close = ny_time.replace(hour=20, minute=0, second=0)
         return market_open <= ny_time <= market_close
 
     async def update_positions(self):
-        """Update current positions from Schwab"""
-        positions = await self.schwab.get_account_positions(self.account_number)
+        """Update current positions from Schwab."""
+        positions = await self.api.get_account_positions(self.account_number)
         self.positions = {
             pos['instrument']['symbol']: pos['longQuantity']
             for pos in positions
@@ -542,43 +731,41 @@ class RSITradingBot:
         }
 
     async def process_symbol(self, symbol: str):
-        """Process a single symbol for trading signals"""
+        """Process a single symbol for trading signals."""
         try:
-            # Get current positions first
             await self.update_positions()
-            
-            # Calculate RSI using the new method
             current_rsi = await self.calculate_rsi(symbol)
             logger.info(f"{symbol} RSI: {current_rsi}")
             
             current_position = self.positions.get(symbol, 0)
             
-            # Cancel any existing pending orders for this symbol
+            # Cancel any existing pending orders
             if symbol in self.pending_orders:
                 order_id = self.pending_orders[symbol]
-                if await self.schwab.cancel_order(self.account_number, order_id):
+                if await self.api.cancel_order(self.account_number, order_id):
                     del self.pending_orders[symbol]
             
-            if current_rsi <= RSI_OVERSOLD and current_position == 0:
+            # Simple RSI-based strategy
+            if current_rsi <= self.rsi_oversold and current_position == 0:
                 # Buy signal
-                order_id = await self.schwab.place_order(
+                order_id = await self.api.place_order(
                     self.account_number,
                     symbol,
                     'BUY',
-                    POSITION_SIZE
+                    int(self.position_size)
                 )
                 if order_id:
                     self.pending_orders[symbol] = order_id
                     await self.log_trade(symbol, 'BUY', current_rsi)
-                    logger.info(f"Bought {POSITION_SIZE} shares of {symbol}")
+                    logger.info(f"Bought {self.position_size} shares of {symbol}")
             
-            elif current_rsi >= RSI_OVERBOUGHT and current_position > 0:
+            elif current_rsi >= self.rsi_overbought and current_position > 0:
                 # Sell signal
-                order_id = await self.schwab.place_order(
+                order_id = await self.api.place_order(
                     self.account_number,
                     symbol,
                     'SELL',
-                    current_position
+                    int(current_position)
                 )
                 if order_id:
                     self.pending_orders[symbol] = order_id
@@ -588,34 +775,79 @@ class RSITradingBot:
         except Exception as e:
             logger.error(f"Error processing {symbol}: {e}")
 
-    async def run(self):
-        """Main bot loop"""
+    async def start(self):
+        """Initialize and start the bot."""
+        logger.info("Starting RSI Trading Bot...")
         try:
-            await self.schwab.connect()
-            
-            while True:
-                if await self.check_market_hours():
-                    logger.info("Market is open, processing symbols...")
-                    await asyncio.gather(*(self.process_symbol(symbol) for symbol in SYMBOLS))
-                else:
-                    logger.info("Market is closed")
-                
-                await asyncio.sleep(60)  # Wait 1 minute before next check
-                
+            # Connect to Schwab
+            self.api = SchwabAPI(self.trader_token, self.market_token)
+            await self.api.connect()
+            try:
+                await self.run()
+            finally:
+                await self.api.disconnect()
         except Exception as e:
             logger.error(f"Bot error: {e}")
+            raise
+
+    async def run(self):
+        """Main bot loop."""
+        logger.info("Connected to Schwab API, starting main loop...")
+        try:
+            while True:
+                try:
+                    if await self.check_market_hours():
+                        logger.info("Market is open, processing symbols...")
+                        for symbol in self.symbols:
+                            try:
+                                logger.info(f"Processing symbol: {symbol}")
+                                await self.process_symbol(symbol)
+                                logger.info(f"Finished processing {symbol}")
+                            except Exception as e:
+                                logger.error(f"Error processing {symbol}: {e}")
+                        logger.info("Finished processing all symbols")
+                    else:
+                        logger.info("Market is closed, waiting for next check")
+                    
+                    logger.info("Waiting 60 seconds before next check...")
+                    await asyncio.sleep(60)
+                    
+                except Exception as e:
+                    logger.error(f"Error in main loop: {e}")
+                    logger.info("Waiting 60 seconds before retry...")
+                    await asyncio.sleep(60)
+                
+        except Exception as e:
+            logger.error(f"Critical bot error: {e}")
+            raise
         finally:
-            await self.schwab.disconnect()
+            logger.info("Cleaning up bot resources...")
 
     async def get_filled_orders(self, days_back: int = 30) -> List[Dict]:
-        """Get filled orders for analysis"""
+        """Get filled orders for analysis."""
         from_date = datetime.now(timezone.utc) - timedelta(days=days_back)
-        return await self.schwab.get_orders(
+        return await self.api.get_orders(
             self.account_number,
             from_date=from_date,
             status="FILLED"
         )
 
+
+async def main():
+    """Main entry point for the trading bot."""
+    try:
+        logger.info("Starting RSI Trading Bot...")
+        bot = RSITradingBot()
+        await bot.start()
+    except Exception as e:
+        logger.error(f"Bot failed to start: {e}")
+        raise
+
 if __name__ == "__main__":
-    bot = RSITradingBot()
-    asyncio.run(bot.run()) 
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Bot failed with error: {e}")
+        raise
