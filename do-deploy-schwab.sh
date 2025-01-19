@@ -55,15 +55,16 @@ users:
 packages:
   - python3-pip
   - python3-venv
+  - python3.10-venv
+  - python3-dev
+  - build-essential
   - git
 
 runcmd:
   - mkdir -p /home/trading/bot/logs
   - chown -R trading:trading /home/trading/bot
-  - sudo -u trading python3 -m venv /home/trading/bot/venv
-  - sudo -u trading /home/trading/bot/venv/bin/pip install -r /home/trading/bot/requirements.schwab.txt
-  - systemctl daemon-reload
-  - systemctl enable schwab-bot
+  - apt-get update
+  - apt-get install -y python3.10-venv
 EOF
 
 # Create droplet
@@ -99,9 +100,22 @@ if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
     exit 1
 fi
 
+# Wait for cloud-init to complete
+echo "Waiting for cloud-init to complete..."
+ssh -o StrictHostKeyChecking=no trading@"$DROPLET_IP" "cloud-init status --wait"
+
 # Copy files
 echo "Copying files..."
 scp -o StrictHostKeyChecking=no -r schwab_bot.py requirements.schwab.txt .env trading@"$DROPLET_IP":/home/trading/bot/
+
+# Set up Python environment and install dependencies
+echo "Setting up Python environment..."
+ssh -o StrictHostKeyChecking=no trading@"$DROPLET_IP" "cd /home/trading/bot && \
+    python3 -m venv venv && \
+    . venv/bin/activate && \
+    pip install --upgrade pip && \
+    pip install wheel && \
+    pip install -r requirements.schwab.txt"
 
 # Create systemd service
 echo "Creating systemd service..."
@@ -115,7 +129,7 @@ Type=simple
 User=trading
 WorkingDirectory=/home/trading/bot
 Environment=PATH=/home/trading/bot/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-ExecStart=/home/trading/bot/venv/bin/python schwab_bot.py
+ExecStart=/home/trading/bot/venv/bin/python3 schwab_bot.py
 Restart=always
 RestartSec=10
 StandardOutput=append:/home/trading/bot/logs/trading.log
@@ -128,9 +142,15 @@ EOF'"
 # Create log directory and set permissions
 ssh -o StrictHostKeyChecking=no trading@"$DROPLET_IP" "sudo mkdir -p /home/trading/bot/logs && sudo chown -R trading:trading /home/trading/bot/logs"
 
-# Start the service
+# Enable and start the service
 echo "Starting the bot service..."
-ssh -o StrictHostKeyChecking=no trading@"$DROPLET_IP" "sudo systemctl daemon-reload && sudo systemctl start schwab-bot"
+ssh -o StrictHostKeyChecking=no trading@"$DROPLET_IP" "sudo systemctl daemon-reload && \
+    sudo systemctl enable schwab-bot && \
+    sudo systemctl start schwab-bot"
+
+# Check service status
+echo "Checking service status..."
+ssh -o StrictHostKeyChecking=no trading@"$DROPLET_IP" "sudo systemctl status schwab-bot --no-pager"
 
 echo "Deployment complete!"
 echo "Your bot has been deployed to: $DROPLET_IP"
