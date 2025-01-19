@@ -94,7 +94,8 @@ sleep 90
 #   In the 'INLINE_MAIN_PY' section, replace the placeholder code with your RSI logic,
 #   or any Python code you want to run continuously.
 
-read -r -d '' BOOTSTRAP_SCRIPT << 'END_BOOTSTRAP'
+echo "Running bootstrap script on droplet $DROPLET_IP ..."
+ssh -o StrictHostKeyChecking=no "$SSH_USER@$DROPLET_IP" "bash -s" << 'END_BOOTSTRAP'
 #!/bin/bash
 set -e
 
@@ -248,17 +249,13 @@ IBKR_PORT = int(os.getenv("IBKR_PORT", "7497"))  # 7497 for paper trading
 
 # Supabase configuration
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://rvtipaoffmymdzqqzuxo.supabase.co")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJ2dGlwYW9mZm15bWR6cXF6dXhvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3MzY4Njk2MTksImV4cCI6MjA1MjQ0NTYxOX0.A1UEMtMauspO8UVdl5ikaOzGA-TYr7v90oLFKWnffFM")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJ2dGlwYW9mZm15bWR6cXF6dXhvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3MDU2MjE2NzAsImV4cCI6MjAyMTE5NzY3MH0.Ue_Ry_epqgXIGYQFXE5umxXM5dtCUqJG-jGwXxGYYtY")
 
-# Initialize Supabase
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-# Trading configuration
-SYMBOLS = ["AAPL", "MSFT", "GOOGL"]  # List of stocks to monitor
+# Trading parameters
+SYMBOLS = ["AAPL", "MSFT", "GOOGL"]  # Stocks to monitor
 RSI_PERIOD = 14
 RSI_OVERBOUGHT = 70
 RSI_OVERSOLD = 30
-CHECK_INTERVAL = 300  # 5 minutes
 POSITION_SIZE = 100  # Number of shares per trade
 
 class IBKRConnection:
@@ -269,222 +266,155 @@ class IBKRConnection:
     async def connect(self):
         try:
             if not self.connected:
-                logger.info("Connecting to IBKR...")
-                self.ib.connect('127.0.0.1', IBKR_PORT, clientId=1)
-                await asyncio.sleep(1)  # Wait for connection
+                await self.ib.connectAsync('localhost', IBKR_PORT, clientId=1)
                 self.connected = True
-                logger.info("Connected to IBKR successfully")
+                logger.info("Successfully connected to IBKR")
         except Exception as e:
             logger.error(f"Failed to connect to IBKR: {e}")
-            self.connected = False
             raise
 
     async def disconnect(self):
         if self.connected:
             self.ib.disconnect()
             self.connected = False
-            logger.info("Disconnected from IBKR")
-
-    def get_contract(self, symbol):
-        return Stock(symbol, 'SMART', 'USD')
 
     async def get_historical_data(self, symbol):
-        try:
-            contract = self.get_contract(symbol)
-            bars = self.ib.reqHistoricalData(
-                contract,
-                endDateTime='',
-                durationStr='5 D',
-                barSizeSetting='1 hour',
-                whatToShow='TRADES',
-                useRTH=True
-            )
-            df = util.df(bars)
-            return df
-        except Exception as e:
-            logger.error(f"Error fetching historical data for {symbol}: {e}")
-            return None
+        contract = Stock(symbol, 'SMART', 'USD')
+        bars = await self.ib.reqHistoricalDataAsync(
+            contract,
+            endDateTime='',
+            durationStr='2 D',
+            barSizeSetting='1 min',
+            whatToShow='TRADES',
+            useRTH=True
+        )
+        return util.df(bars)
 
     async def place_order(self, symbol, action, quantity):
+        contract = Stock(symbol, 'SMART', 'USD')
+        order = MarketOrder(action, quantity)
+        trade = await self.ib.placeOrderAsync(contract, order)
+        return trade
+
+class RSITradingBot:
+    def __init__(self):
+        self.ibkr = IBKRConnection()
+        self.supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        self.positions = {}
+
+    def calculate_rsi(self, df):
+        return ta.rsi(df['close'], length=RSI_PERIOD)
+
+    async def log_trade(self, symbol, action, rsi_value):
         try:
-            contract = self.get_contract(symbol)
-            order = MarketOrder(action, quantity)
-            trade = self.ib.placeOrder(contract, order)
-            while not trade.isDone():
-                await asyncio.sleep(1)
-            logger.info(f"Order completed: {symbol} {action} {quantity} shares")
-            return trade
+            self.supabase.table('trades').insert({
+                'symbol': symbol,
+                'action': action,
+                'rsi': float(rsi_value),
+                'timestamp': datetime.now(timezone.utc).isoformat()
+            }).execute()
+            logger.info(f"Trade logged: {symbol} {action} RSI={rsi_value}")
         except Exception as e:
-            logger.error(f"Error placing order for {symbol}: {e}")
-            return None
+            logger.error(f"Failed to log trade: {e}")
 
-def calculate_rsi(data: pd.DataFrame, period: int = 14) -> float:
-    """Calculate RSI for the given data."""
-    try:
-        rsi = ta.rsi(data['close'], length=period)
-        return float(rsi.iloc[-1])
-    except Exception as e:
-        logger.error(f"Error calculating RSI: {e}")
-        return None
+    async def check_market_hours(self):
+        now = datetime.now(timezone.utc)
+        if now.weekday() >= 5:  # Weekend
+            return False
+        ny_time = now.replace(tzinfo=timezone.utc).astimezone(timezone.utc)
+        market_open = ny_time.replace(hour=13, minute=30, second=0)  # 9:30 AM ET
+        market_close = ny_time.replace(hour=20, minute=0, second=0)  # 4:00 PM ET
+        return market_open <= ny_time <= market_close
 
-async def log_to_supabase(symbol: str, rsi: float, price: float, action: str = None):
-    """Log trading data to Supabase."""
-    try:
-        data = {
-            "symbol": symbol,
-            "rsi": rsi,
-            "price": price,
-            "action": action,
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        }
-        result = supabase.table("trading_logs").insert(data).execute()
-        logger.info(f"Logged to Supabase: {data}")
-        return result
-    except Exception as e:
-        logger.error(f"Error logging to Supabase: {e}")
-        return None
-
-async def process_symbol(ibkr: IBKRConnection, symbol: str):
-    """Process a single symbol."""
-    try:
-        # 1. Fetch historical data
-        df = await ibkr.get_historical_data(symbol)
-        if df is None or df.empty:
-            logger.error(f"No data received for {symbol}, skipping")
-            return
-
-        # 2. Calculate RSI
-        current_price = float(df['close'].iloc[-1])
-        rsi = calculate_rsi(df, RSI_PERIOD)
-        
-        if rsi is None:
-            logger.error(f"Failed to calculate RSI for {symbol}")
-            return
-
-        # 3. Log current state
-        logger.info(f"Symbol: {symbol}, Price: {current_price:.2f}, RSI: {rsi:.2f}")
-
-        # 4. Generate and execute trading signals
-        action = None
-        if rsi > RSI_OVERBOUGHT:
-            logger.info(f"{symbol} - SELL Signal - RSI: {rsi:.2f}")
-            trade = await ibkr.place_order(symbol, "SELL", POSITION_SIZE)
-            action = "SELL"
-        elif rsi < RSI_OVERSOLD:
-            logger.info(f"{symbol} - BUY Signal - RSI: {rsi:.2f}")
-            trade = await ibkr.place_order(symbol, "BUY", POSITION_SIZE)
-            action = "BUY"
-
-        # 5. Log to Supabase
-        await log_to_supabase(symbol, rsi, current_price, action)
-
-    except Exception as e:
-        logger.error(f"Error processing {symbol}: {e}")
-
-async def main():
-    logger.info("RSI Trading Bot starting...")
-    ibkr = IBKRConnection()
-    
-    while True:
+    async def process_symbol(self, symbol):
         try:
-            # Connect to IBKR
-            await ibkr.connect()
+            df = await self.ibkr.get_historical_data(symbol)
+            if df.empty:
+                logger.warning(f"No data received for {symbol}")
+                return
 
-            if is_market_open():
-                # Process all symbols concurrently
-                await asyncio.gather(*[process_symbol(ibkr, symbol) for symbol in SYMBOLS])
-            else:
-                logger.info("Market is closed. Waiting...")
-                await asyncio.sleep(CHECK_INTERVAL)
-                continue
+            rsi = self.calculate_rsi(df)
+            current_rsi = rsi.iloc[-1]
+            logger.info(f"{symbol} RSI: {current_rsi}")
+
+            if current_rsi <= RSI_OVERSOLD and symbol not in self.positions:
+                # Buy signal
+                trade = await self.ibkr.place_order(symbol, 'BUY', POSITION_SIZE)
+                self.positions[symbol] = POSITION_SIZE
+                await self.log_trade(symbol, 'BUY', current_rsi)
+                logger.info(f"Bought {POSITION_SIZE} shares of {symbol}")
+
+            elif current_rsi >= RSI_OVERBOUGHT and symbol in self.positions:
+                # Sell signal
+                trade = await self.ibkr.place_order(symbol, 'SELL', self.positions[symbol])
+                del self.positions[symbol]
+                await self.log_trade(symbol, 'SELL', current_rsi)
+                logger.info(f"Sold {POSITION_SIZE} shares of {symbol}")
 
         except Exception as e:
-            logger.error(f"Error in main loop: {e}")
-            await ibkr.disconnect()  # Disconnect on error
-            await asyncio.sleep(60)  # Wait before retrying
-            continue
+            logger.error(f"Error processing {symbol}: {e}")
 
-        await asyncio.sleep(CHECK_INTERVAL)
-
-def is_market_open() -> bool:
-    """Check if US stock market is open."""
-    now = datetime.now(timezone.utc)
-    if now.weekday() > 4:  # Weekend
-        return False
-    et_hour = (now.hour - 4) % 24  # UTC-4 for ET
-    return 9.5 <= et_hour < 16  # 9:30 AM - 4:00 PM ET
+    async def run(self):
+        try:
+            await self.ibkr.connect()
+            
+            while True:
+                if await self.check_market_hours():
+                    logger.info("Market is open, processing symbols...")
+                    await asyncio.gather(*(self.process_symbol(symbol) for symbol in SYMBOLS))
+                else:
+                    logger.info("Market is closed")
+                
+                await asyncio.sleep(60)  # Wait 1 minute before next check
+                
+        except Exception as e:
+            logger.error(f"Bot error: {e}")
+        finally:
+            await self.ibkr.disconnect()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    bot = RSITradingBot()
+    asyncio.run(bot.run())
 EOF
 
-# 4. Write requirements.txt inline
+# 4. Write requirements.txt
 cat << 'EOF' > requirements.txt
 pandas==2.1.4
 pandas-ta==0.3.14b0
-supabase==1.0.3
-ib_insync==0.9.86
-python-dotenv==1.0.0
+supabase==2.3.0
+ib-insync==0.9.86
 EOF
 
-# 5. Create a python venv + install deps
+# 5. Create venv and install requirements
 python3 -m venv venv
 source venv/bin/activate
-pip install --upgrade pip
 pip install -r requirements.txt
 
-# 6. Create .env file for configuration
-cat << 'ENV_EOF' > .env
-IBKR_USERNAME=scap3883
-IBKR_PASSWORD=XMVSKhajEx9ZN!Q
-IBKR_PORT=7497
-SUPABASE_URL=https://rvtipaoffmymdzqqzuxo.supabase.co
-SUPABASE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJ2dGlwYW9mZm15bWR6cXF6dXhvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3MzY4Njk2MTksImV4cCI6MjA1MjQ0NTYxOX0.A1UEMtMauspO8UVdl5ikaOzGA-TYr7v90oLFKWnffFM
-ENV_EOF
-
-# 7. Create a systemd service that loads environment variables
-SERVICE_PATH="/etc/systemd/system/rsi-bot.service"
-cat << SERVICE_EOF > "$SERVICE_PATH"
+# 6. Create systemd service
+cat << 'EOF' > /etc/systemd/system/rsi-bot.service
 [Unit]
 Description=RSI Trading Bot
-After=network.target
+After=network.target ibgateway.service
 
 [Service]
 Type=simple
 User=root
-WorkingDirectory=$BOT_DIR
-EnvironmentFile=$BOT_DIR/.env
-ExecStart=/bin/bash -c 'cd $BOT_DIR && source venv/bin/activate && python main.py'
+WorkingDirectory=/bot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/bot/venv/bin/python main.py
 Restart=always
+RestartSec=30
 
 [Install]
 WantedBy=multi-user.target
-SERVICE_EOF
+EOF
 
-# 8. Reload systemd, enable & start
+# 7. Enable and start the service
 systemctl daemon-reload
 systemctl enable rsi-bot
 systemctl start rsi-bot
 
-echo "SUCCESS: RSI bot deployed and running under systemd."
+echo "Bootstrap complete!"
 END_BOOTSTRAP
 
-###################################
-# 5) SSH into droplet, run bootstrap
-###################################
-echo "Running bootstrap script on droplet $DROPLET_IP ..."
-ssh -o StrictHostKeyChecking=no "$SSH_USER@$DROPLET_IP" "bash -s" << EOF
-$BOOTSTRAP_SCRIPT
-EOF
-
-if [ $? -ne 0 ]; then
-  echo "ERROR: Bootstrap script failed."
-  exit 1
-fi
-
-###################################
-# Done!
-###################################
-echo "All done! Your RSI bot droplet is at $DROPLET_IP."
-echo "You can SSH in with: ssh $SSH_USER@$DROPLET_IP"
-echo "Check the bot logs via: journalctl -u rsi-bot -f"
+echo "Setup completed successfully!"
