@@ -64,7 +64,6 @@ runcmd:
   - sudo -u trading /home/trading/bot/venv/bin/pip install -r /home/trading/bot/requirements.schwab.txt
   - systemctl daemon-reload
   - systemctl enable schwab-bot
-  - systemctl start schwab-bot
 EOF
 
 # Create droplet
@@ -102,8 +101,7 @@ fi
 
 # Copy files
 echo "Copying files..."
-scp -o StrictHostKeyChecking=no -r schwab_bot.py requirements.schwab.txt .env.schwab.example trading@"$DROPLET_IP":/home/trading/bot/
-ssh -o StrictHostKeyChecking=no trading@"$DROPLET_IP" "cd /home/trading/bot && cp .env.schwab.example .env"
+scp -o StrictHostKeyChecking=no -r schwab_bot.py requirements.schwab.txt .env trading@"$DROPLET_IP":/home/trading/bot/
 
 # Create systemd service
 echo "Creating systemd service..."
@@ -120,20 +118,33 @@ Environment=PATH=/home/trading/bot/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/
 ExecStart=/home/trading/bot/venv/bin/python schwab_bot.py
 Restart=always
 RestartSec=10
+StandardOutput=append:/home/trading/bot/logs/trading.log
+StandardError=append:/home/trading/bot/logs/trading.log
 
 [Install]
 WantedBy=multi-user.target
 EOF'"
+
+# Create log directory and set permissions
+ssh -o StrictHostKeyChecking=no trading@"$DROPLET_IP" "sudo mkdir -p /home/trading/bot/logs && sudo chown -R trading:trading /home/trading/bot/logs"
+
+# Start the service
+echo "Starting the bot service..."
+ssh -o StrictHostKeyChecking=no trading@"$DROPLET_IP" "sudo systemctl daemon-reload && sudo systemctl start schwab-bot"
 
 echo "Deployment complete!"
 echo "Your bot has been deployed to: $DROPLET_IP"
 echo ""
 echo "Next steps:"
 echo "1. SSH into your server: ssh trading@$DROPLET_IP"
-echo "2. Edit the environment file: nano /home/trading/bot/.env"
-echo "3. Start the bot: sudo systemctl start schwab-bot"
+echo "2. Check the bot status: sudo systemctl status schwab-bot"
 echo ""
 echo "To monitor the bot:"
 echo "- Check status: sudo systemctl status schwab-bot"
-echo "- View logs: sudo journalctl -fu schwab-bot"
-echo "- Check detailed logs: tail -f /home/trading/bot/logs/trading.log" 
+echo "- View service logs: sudo journalctl -fu schwab-bot"
+echo "- View application logs: tail -f /home/trading/bot/logs/trading.log"
+echo ""
+echo "To manage the bot:"
+echo "- Stop bot: sudo systemctl stop schwab-bot"
+echo "- Start bot: sudo systemctl start schwab-bot"
+echo "- Restart bot: sudo systemctl restart schwab-bot" 

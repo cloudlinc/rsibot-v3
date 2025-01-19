@@ -18,4 +18,3 @@ runcmd:
   - sudo -u trading /home/trading/bot/venv/bin/pip install -r /home/trading/bot/requirements.schwab.txt
   - systemctl daemon-reload
   - systemctl enable schwab-bot
-  - systemctl start schwab-bot
